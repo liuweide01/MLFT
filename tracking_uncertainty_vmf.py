@@ -2,6 +2,7 @@ import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import torch
 import numpy as np
+from scipy.stats import vonmises
 from dataset_tracking import DWI_dataset, spherical_to_cartesian_torch
 
 import torch.backends.cudnn as cudnn
@@ -39,7 +40,8 @@ cudnn.deterministic = True#
 
 os.makedirs(saved_trk_folder, exist_ok=True)
 
-saved_model  = './saved_model_merge/final.pth'
+
+saved_model  = './saved_model_merge_1/final.pth'
 
 model = Model(in_channels=28, out_channels=16, img_size=[128, 128, 128])
 model.load_state_dict(torch.load(saved_model), strict=True)
@@ -53,8 +55,6 @@ model= nn.DataParallel(model).to(device)
 def remove_after_threshold_in_list(arr_list, threshold=128):
     result_list = []
     for arr in arr_list:
-        # Find indices where the condition is True
-        # indices = np.where(arr > threshold)[0]
         indices_above_threshold = np.where(arr > threshold)[0]
         indices_below_zero = np.where(arr < 0)[0]
 
@@ -62,20 +62,13 @@ def remove_after_threshold_in_list(arr_list, threshold=128):
         first_index = indices.min() if indices.size > 0 else None
 
         if first_index is not None:
-            # If there's at least one invalid value,
-            # keep elements up to the first such value
             result_list.append(arr[:first_index])
         else:
-            # If no invalid values are found, append the original array
             result_list.append(arr)
     return result_list
 
 
 def _random_VMF_cos(d, kappa, n, device):
-    """
-    Generate n iid samples t with density function using PyTorch,
-    replacing numpy's beta and exponential distributions.
-    """
     b = (d - 1) / (2 * kappa + torch.sqrt(4 * kappa ** 2 + (d - 1) ** 2))
     x0 = (1 - b) / (1 + b)
     c = kappa * x0 + (d - 1) * torch.log(1 - x0 ** 2)
@@ -96,9 +89,6 @@ def _random_VMF_cos(d, kappa, n, device):
     return out[:n]
 
 def random_VMF(mu_or, kappa, size=None, device='cuda'):
-    """
-    Von Mises-Fisher distribution sampler adjusted for PyTorch and batch operations.
-    """
     mu_or = mu_or.to(device)
     bs, d = mu_or.shape
     n = torch.prod(torch.tensor(size)).item() if size is not None else 1
@@ -115,14 +105,11 @@ def random_VMF(mu_or, kappa, size=None, device='cuda'):
     z = z - mu_z.unsqueeze(-1) * mu_or.unsqueeze(1)
     z /= torch.norm(z, dim=2, keepdim=True)
 
-    # Assuming _random_VMF_cos can already handle batch operations and returns a flat vector
     cos = _random_VMF_cos(d, kappa, n * bs, device).view(bs, n, 1)
     sin = torch.sqrt(1 - cos ** 2)
 
-    # Adjust dimensions of mu_or for the operation
     mu_or_expanded = mu_or.view(bs, 1, d).expand(-1, n, -1)
 
-    # Combine angles with the z component
     x = z * sin + cos * mu_or_expanded
 
     return x.view(bs, n, d)
@@ -132,22 +119,17 @@ def rotate_batch_vectors(a, b, m):
     a_unit = a / torch.linalg.norm(a, dim=1, keepdim=True)
     b_unit = b / torch.linalg.norm(b, dim=1, keepdim=True)
 
-    # Calculate rotation axis (cross product of a and b)
     axis = torch.cross(a_unit, b_unit)
     axis_norm = torch.linalg.norm(axis, dim=1, keepdim=True)
 
-    # Check for valid rotation (non-zero axis_norm) and avoid division by zero
     valid = axis_norm.squeeze() > 0
     axis[valid] = axis[valid] / axis_norm[valid]
 
-    # Calculate the angle between a and b
     cos_angle = torch.sum(a_unit * b_unit, dim=1, keepdim=True)
     angle = torch.arccos(torch.clamp(cos_angle, -1.0, 1.0))
 
-    # Scale the angle
     scaled_angle = angle * m
 
-    # Rodrigues' rotation formula
     a_rot = (a_unit * torch.cos(scaled_angle) +
              torch.cross(axis, a_unit) * torch.sin(scaled_angle) +
              axis * (torch.sum(axis * a_unit, dim=1, keepdim=True)) * (1 - torch.cos(scaled_angle)))
@@ -161,10 +143,8 @@ def custom_sigmoid(a, a_min=0.15, a_max=0.25, b_min=0.1, b_max=0.9):
     steepness = 15
     midpoint = (a_min + a_max) / 2
 
-    # Ensure a is a PyTorch tensor
     a = torch.tensor(a, dtype=torch.float32)
 
-    # Adjusted sigmoid function for the transition
     b = (b_max - b_min) / (1 + torch.exp(steepness * (a - midpoint))) + b_min
 
     return b
@@ -211,7 +191,6 @@ with torch.no_grad():
                 theta = torch.clamp(theta, min=0, max=torch.pi)
                 phi = torch.clamp(phi, min=-torch.pi, max=torch.pi)
 
-                # path_point = data
                 current_point = path_point
 
                 pre_theta = torch.zeros(path_point.shape[0], 12).to(device)
@@ -228,7 +207,7 @@ with torch.no_grad():
                 for b in range(current_point.shape[0]):  # Save points for each item in the batch
                     saved_points[b].append(current_point_np[b])
 
-                for step in range(220):
+                for step in range(240):
                     differences = current_point_np[:, np.newaxis, :] - mean_positions[np.newaxis, :, :]
                     distances = np.sqrt(np.sum(differences ** 2, axis=2))
                     sum_distances = distances.sum(axis=1, keepdims=True)
@@ -256,16 +235,15 @@ with torch.no_grad():
 
                     delta_xyz = random_VMF(delta_xyz_pre.squeeze(), kappa=torch.tensor(64).to(device), size=1, device=device).reshape(bs, d, 1)
 
-                    # Fa part
-                    if fa:
-                        point_round = torch.round(current_point).to(torch.int32)
-                        z, y, x = point_round[:, 2], point_round[:, 1], point_round[:, 0]
-                        try:
-                            fa_value = custom_sigmoid(fa_img[x, y, z])
-                            new_xyz = rotate_batch_vectors(delta_xyz_pre, delta_xyz, fa_value) * 0.5
-                        except:
-                            new_xyz = delta_xyz
-                    # End Fa part
+                    ## Fa part
+                    # point_round = torch.round(current_point).to(torch.int32)
+                    # z, y, x = point_round[:, 2], point_round[:, 1], point_round[:, 0]
+                    # try:
+                    #     fa_value = custom_sigmoid(fa_img[x, y, z])
+                    #     new_xyz = rotate_batch_vectors(delta_xyz_pre, delta_xyz, fa_value) * 0.5
+                    # except:
+                    #     new_xyz = delta_xyz
+                    ## End Fa part
 
                     try:
                         # next_point = new_xyz[:,:,0].detach().cpu().numpy()

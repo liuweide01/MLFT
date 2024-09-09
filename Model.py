@@ -43,6 +43,7 @@ class Model(nn.Module):
         res_block: bool = True,
         dropout_rate: float = 0.0,
     ) -> None:
+
         super().__init__()
 
         if not (0 <= dropout_rate <= 1):
@@ -167,28 +168,38 @@ class Model(nn.Module):
         )
 
         self.grid_dim = 3
-        self.fc_theta_pre_1_next = nn.Linear(3488 + 64, 1024)
+        # self.fc_theta_pre = nn.Conv2d(feature_size* 21 *(self.grid_dim**3), feature_size* 21 *(self.grid_dim**3), kernel_size=1, bias=False)  # type: ignore
+        self.fc_theta_pre_1_next = nn.Linear(8864, 1024)
         self.fc_theta = nn.Linear( 1024 , 1)
-        self.fc_phi_pre_1_next = nn.Linear(3488 + 64, 1024)
+        self.fc_phi_pre_1_next = nn.Linear(8864, 1024)
         self.fc_phi = nn.Linear(1024,1)  # type: ignore
         self.encoder_direction_theta_pre = nn.Linear(6, 128)
         self.encoder_direction_phi_pre = nn.Linear(6, 128)
         self.activation = nn.LeakyReLU()
         self.relu = nn.ReLU()
-        self.real_feature_3 = nn.Linear(64, 64)
-        self.real_feature_2 = nn.Linear(32, 64)
-        self.real_feature_1 = nn.Linear(16, 128)
+        self.real_feature_3 = nn.Linear(64 + 64, 64)
+        self.real_feature_2 = nn.Linear(32 + 64, 64)
+        self.real_feature_1 = nn.Linear(16 + 32, 128)
 
-        self.real_feature_3_next = nn.Linear(64, 64)
-        self.real_feature_2_next = nn.Linear(32, 64)
-        self.real_feature_1_next = nn.Linear(16, 128)
+        self.real_feature_3_next = nn.Linear(64 + 64, 64)
+        self.real_feature_2_next = nn.Linear(32 + 64, 64)
+        self.real_feature_1_next = nn.Linear(16 + 32, 128)
 
         self.position_encoding = nn.Linear(5, 64)
+
+        self.fix_encoder_0 = nn.Conv3d(1, 8, kernel_size=3, stride=2, padding=1)
+        self.fix_encoder_1 = nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1)
+        self.fix_encoder_2 = nn.Conv3d(16, 32, kernel_size=3, stride=2, padding=1)
+
+
+        self.fix_encoder_0_tom = nn.Conv3d(6, 8, kernel_size=3, stride=2, padding=1)
+        self.fix_encoder_1_tom = nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1)
+        self.fix_encoder_2_tom = nn.Conv3d(16, 32, kernel_size=3, stride=2, padding=1)
+
 
     def proj_feat(self, x, hidden_size, feat_size):
         x = x.view(x.size(0), feat_size[0], feat_size[1], feat_size[2], hidden_size)
         x = x.permute(0, 4, 1, 2, 3).contiguous()
-
         return x
 
     def calculate_batch_value_at_points(self, extracted_feature, target_points):
@@ -221,7 +232,19 @@ class Model(nn.Module):
         return weighted_values  # [bs, 64]
 
 
-    def forward(self, x_in, point,pre_theta,pre_phi, next_point, position_vector):
+    def forward(self, x_in, point,pre_theta,pre_phi, next_point, position_vector, seg, fix_0, fix_1):
+        tom_cat  = torch.cat([fix_0, fix_1], dim= 1)
+
+        tom_feature = self.relu(self.fix_encoder_1_tom(self.relu(self.fix_encoder_0_tom(tom_cat))))
+        tom_feature_real = self.relu(self.fix_encoder_2_tom(tom_feature) )
+
+        fix_feature = self.relu(self.fix_encoder_1(self.relu(self.fix_encoder_0(seg))))
+        seg_feature = self.relu(self.fix_encoder_2(fix_feature))
+
+        fix_feature = torch.cat([fix_feature, tom_feature], dim= 1)
+        seg_feature = torch.cat([seg_feature, tom_feature_real], dim= 1)
+
+
         bs = point.shape[0]
 
         x, hidden_states_out = self.vit(x_in)
@@ -239,22 +262,37 @@ class Model(nn.Module):
         dec3 = self.decoder5(dec4, enc4)
         dec2 = self.decoder4(dec3, enc3)
         point_32 = point/4
-        feat_32 = extract_features_with_padding(dec2.permute(0,2,3,4,1).squeeze(),point_32)  # torch.Size([2, 3, 3, 3, 64])
+
+        interpolated_feature_2 = F.interpolate(seg_feature, size=(dec2.shape[2], dec2.shape[3], dec2.shape[4]),
+                                             mode='trilinear', align_corners=False)
+        dec2_fix = torch.cat([dec2, interpolated_feature_2], dim=1)
+
+        feat_32 = extract_features_with_padding(dec2_fix.permute(0,2,3,4,1).squeeze(),point_32)  # torch.Size([2, 3, 3, 3, 64])
         real_point32 = point_32 - torch.floor(point_32).int() + 1.0
         real_point32_feature = self.calculate_batch_value_at_points(feat_32, real_point32)
         feat_32 = feat_32[:,1,1,1,:].view(bs, -1)
         real_point32_feature = self.real_feature_3(real_point32_feature.to(torch.float)).view(bs, -1)
 
         dec1 = self.decoder3(dec2, enc2)
+
+        interpolated_feature_1 = F.interpolate(seg_feature, size=(dec1.shape[2], dec1.shape[3], dec1.shape[4]),
+                                               mode='trilinear', align_corners=False)
+        dec1_fix = torch.cat([dec1, interpolated_feature_1], dim=1)
+
         point_31 = point/2
-        feat_31 = extract_features_with_padding(dec1.permute(0,2,3,4,1).squeeze(),point_31)
+        feat_31 = extract_features_with_padding(dec1_fix.permute(0,2,3,4,1).squeeze(),point_31)
         real_point31 = point_31 - torch.floor(point_31).int() + 1.0
         real_point31_feature = self.calculate_batch_value_at_points(feat_31, real_point31)
         feat_31 = feat_31.view(bs, -1)
         real_point31_feature = self.real_feature_2(real_point31_feature.to(torch.float)).view(bs, -1)
 
         out = self.decoder2(dec1, enc1)
-        feat_30 = extract_features_with_padding(out.permute(0,2,3,4,1).squeeze(),point)
+
+        interpolated_feature_out = F.interpolate(fix_feature, size=(out.shape[2], out.shape[3], out.shape[4]),
+                                               mode='trilinear', align_corners=False)
+        out_fix = torch.cat([out, interpolated_feature_out], dim=1)
+
+        feat_30 = extract_features_with_padding(out_fix.permute(0,2,3,4,1).squeeze(),point)
         real_point30 = point - torch.floor(point).int() + 1.0
         real_point30_feature = self.calculate_batch_value_at_points(feat_30, real_point30)
         feat_30 = feat_30.view(bs, -1)
@@ -262,7 +300,7 @@ class Model(nn.Module):
 
         ####################################################
         next_point_4 = next_point / 4
-        feat_32_next = extract_features_with_padding(dec2.permute(0, 2, 3, 4, 1).squeeze(),
+        feat_32_next = extract_features_with_padding(dec2_fix.permute(0, 2, 3, 4, 1).squeeze(),
                                                 next_point_4)
         real_point32_next = next_point_4 - torch.floor(next_point_4).int() + 1.0
         real_point32_feature_next = self.calculate_batch_value_at_points(feat_32_next, real_point32_next)
@@ -271,14 +309,14 @@ class Model(nn.Module):
 
 
         point_31_next = next_point / 2
-        feat_31_next = extract_features_with_padding(dec1.permute(0, 2, 3, 4, 1).squeeze(), point_31_next)
+        feat_31_next = extract_features_with_padding(dec1_fix.permute(0, 2, 3, 4, 1).squeeze(), point_31_next)
         real_point31_next = point_31_next - torch.floor(point_31_next).int() + 1.0
         real_point31_feature_next = self.calculate_batch_value_at_points(feat_31_next, real_point31_next)
         feat_31_next = feat_31_next.view(bs, -1)
         real_point31_feature_next = self.real_feature_2_next(real_point31_feature_next.to(torch.float)).view(bs, -1)
 
 
-        feat_30_next = extract_features_with_padding(out.permute(0, 2, 3, 4, 1).squeeze(), next_point)
+        feat_30_next = extract_features_with_padding(out_fix.permute(0, 2, 3, 4, 1).squeeze(), next_point)
         real_point30_next = next_point - torch.floor(next_point).int() + 1.0
         real_point30_feature_next = self.calculate_batch_value_at_points(feat_30_next, real_point30_next)
         feat_30_next = feat_30_next.view(bs, -1)
@@ -291,6 +329,7 @@ class Model(nn.Module):
         direct_feats_phi = self.relu(self.encoder_direction_phi_pre(pre_phi))
         position_feature = self.position_encoding(position_vector)
 
+        # print(feat_32.shape,feat_31.shape,feat_30.shape)
         feats_thetaphi = torch.cat([feat_32, feat_31,feat_30,real_point32_feature, real_point31_feature, real_point30_feature,
                                     feat_32_next, feat_31_next,feat_30_next,real_point32_feature_next, real_point31_feature_next, real_point30_feature_next,
                                     direct_feats_theta,direct_feats_phi,position_feature],dim=1)
@@ -313,10 +352,14 @@ if __name__ == '__main__':
 
     distance_vector = torch.zeros(point.shape[0], 5).to('cuda')
 
-    theta, phi = model(x, point,pre_theta,pre_phi,point,distance_vector)
+    x1 = torch.randn([1, 1, 128, 128, 128]).to('cuda')
+    x2 = torch.randn([1, 3, 128, 128, 128]).to('cuda')
+
+    theta, phi = model(x, point,pre_theta,pre_phi,point,distance_vector, x1, x2, x2)
 
     delta_xyz = spherical_to_cartesian_torch(1, theta, phi)
 
     cos_sim = F.cosine_similarity(delta_xyz, delta_xyz)
     cos_sim_loss = 1 - cos_sim
+
     print(theta, phi, cos_sim_loss)

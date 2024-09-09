@@ -22,8 +22,17 @@ class DWI_dataset(Dataset):
         self.dwi_path = os.path.join('../Track_Subjects/All_segmentations_final', subject_name + '.nii.gz')
         self.mask_path = os.path.join('../Track_Subjects/All_segmentations_final', subject_name + '_5tt.nii.gz')
         self.position_path = os.path.join('../Track_Subjects/parcel_5', subject_name + '.csv')
+        self.seg_path = os.path.join('../Track_Subjects/All_segmentations_final', subject_name + '_5tt.nii.gz')
+        self.fix_0_path = os.path.join('../../affine/TOMs/', subject_name + '_fixel_map_0.nii.gz')
+        self.fix_1_path = os.path.join('../../affine/TOMs/', subject_name + '_fixel_map_1.nii.gz')
+
 
         self.fod_img = torch.tensor(np.squeeze(nib.load(self.fod_path).get_fdata())).float()
+        self.fix_0_img = torch.tensor(np.squeeze(nib.load(self.fix_0_path).get_fdata())).float()
+        self.fix_1_img = torch.tensor(np.squeeze(nib.load(self.fix_1_path).get_fdata())).float()
+        self.seg_img = torch.tensor(np.squeeze(nib.load(self.seg_path).get_fdata())).float()
+        self.seg_img = torch.argmax(self.seg_img, dim=-1, keepdim=True).float()
+
         self.trk = load_trk(self.trk_path, self.dwi_path).streamlines
         self.dwi_feature = torch.tensor(np.squeeze(nib.load(self.dwi_path).get_fdata())).float()
         self.mask = torch.tensor(np.squeeze(nib.load(self.mask_path).get_fdata())).float()
@@ -36,7 +45,6 @@ class DWI_dataset(Dataset):
         length = trk_list.shape[0]
 
         mean_positions = np.genfromtxt(self.position_path, delimiter=',', skip_header=1)[:, 1:]
-
 
         if random.random() > 0.5:
             differences = trk_list[:-1, :][:, np.newaxis, :] - mean_positions[np.newaxis, :, :]
@@ -78,28 +86,18 @@ def cartesian_to_spherical(p1, p2):
     p1 = np.asarray(p1)
     p2 = np.asarray(p2)
 
-    # Calculate the vectors from each point in p1 to the corresponding point in p2
     vectors = p2 - p1
-
-    # Calculate the radial distances
     r = np.linalg.norm(vectors, axis=1)
 
-    # Calculate the polar angles (theta)
     theta = np.arccos(vectors[:, 2] / r)
 
-    # Calculate the azimuthal angles (phi)
     phi = np.arctan2(vectors[:, 1], vectors[:, 0])
 
-    # Handle cases where r is zero to avoid division by zero
     theta[r == 0] = 0
 
-    # return np.vstack((r, theta, phi)).T
     return r, theta, phi
 
 def spherical_to_cartesian(r, theta, phi):
-    # Extracting r, theta, and phi
-    # theta, phi = spherical_coords[:, 0], spherical_coords[:, 1]
-    # Convert spherical to Cartesian coordinates
     x = r * np.sin(theta) * np.cos(phi)
     y = r * np.sin(theta) * np.sin(phi)
     z = r * np.cos(theta)
@@ -107,9 +105,6 @@ def spherical_to_cartesian(r, theta, phi):
     return np.column_stack((x, y, z))
 
 def spherical_to_cartesian_torch(r, theta, phi):
-    # Extracting theta and phi from the spherical coordinates
-    # theta, phi = spherical_coords[:, 0], spherical_coords[:, 1]
-    # Convert spherical to Cartesian coordinates using PyTorch operations
     x = r * torch.sin(theta) * torch.cos(phi)
     y = r * torch.sin(theta) * torch.sin(phi)
     z = r * torch.cos(theta)
@@ -135,28 +130,19 @@ def interpolate_curve_cubic_spline(samples, step_size=0.5):
     return np.array(interpolated_points).T  # Transpose to get points in the original format
 
 def calculate_intersection_distance(spherical_coords, k=step_length):
-    # Convert spherical to Cartesian direction
-    # r, theta, phi = spherical_coords
     theta, phi = spherical_coords[:,0], spherical_coords[:,1]
     direction = np.array([  #[B,3]
         np.sin(theta) * np.cos(phi),
         np.sin(theta) * np.sin(phi),
         np.cos(theta)
     ]).T
-
-    # Normalize the direction vector    这里似乎不需要正则化？因为上一行里面每个向量的长度一定为1
-    # direction = direction / np.linalg.norm(direction)
-
-    # Calculate intersection distances for each face of the cube
     distances = []
     for i in range(3):
-        if np.all(direction[i] != 0):   #需要np.all()
+        if np.all(direction[i] != 0):
             # Positive and negative faces
             d_pos = (k - 0) / direction[i]
             d_neg = (0 - 0) / direction[i]
             distances.extend([d_pos, d_neg])
-
-    # Get the smallest positive distance
     r1 = min([d for d in distances if d > 0])
 
     return r1
@@ -176,7 +162,6 @@ def generate_3d_grid(center, range=1, step=1):
 
     X, Y, Z = np.meshgrid(x_range, y_range, z_range, indexing='ij')
     grid_points = np.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T
-
     return grid_points
 
 
@@ -253,7 +238,6 @@ def extract_features_with_padding_gpu(features, center_points, grid_range=1, ste
     batch_size, _ = center_points.size()
     feature_dim = features.shape[-1]  # The feature dimension
 
-    # Dimensions of the grid
     grid_dim = grid_dim
 
     # Prepare a tensor to hold all extracted features (on GPU)
@@ -291,8 +275,6 @@ def convert_seconds(seconds):
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-
 
 if __name__ == '__main__':
     train_set = DWI_dataset('m-atlas_tensor_f1204s1-CWLLS1', max_len=30)
